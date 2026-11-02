@@ -1,262 +1,488 @@
+"""RepoGuide AI - understand any codebase, one step at a time.
+
+Local-first: every prompt goes to an open-weight model running in Ollama on
+your own machine. No API keys, no data leaving the computer.
+"""
+
+from __future__ import annotations
+
+import time
+
 import streamlit as st
-import requests
-import json
 
-# Configuration
-OLLAMA_URL = "http://localhost:11434/api/chat"
-# We'll try to detect the model, but default to 'gemma' or 'gemma2'
-DEFAULT_MODEL = "gemma" 
+from repoguide import config
+from repoguide.ingest import (
+    Ingest,
+    from_github,
+    from_text,
+    from_uploads,
+    max_chars_for,
+    render,
+)
+from repoguide.ollama import ModelMissing, OllamaClient, OllamaError
+from repoguide.prompts import MODES, build_analysis_messages
 
-def get_available_models():
-    try:
-        response = requests.get("http://localhost:11434/api/tags")
-        if response.status_code == 200:
-            models = [m['name'] for m in response.json().get('models', [])]
-            return models
-    except Exception:
-        return []
-    return []
+# --------------------------------------------------------------------------
+# Page setup
+# --------------------------------------------------------------------------
+st.set_page_config(
+    page_title=f"{config.APP_NAME} · {config.VERSION}",
+    page_icon=config.APP_ICON,
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-def call_ollama(prompt, content, model_name):
-    full_prompt = f"{prompt}\n\nContent to analyze:\n{content}"
-    payload = {
-        "model": model_name,
-        "messages": [{"role": "user", "content": full_prompt}],
-        "stream": False
-    }
-    try:
-        response = requests.post(OLLAMA_URL, json=payload, timeout=300)
-        if response.status_code == 200:
-            return response.json()['message']['content']
+st.markdown(
+    """
+<style>
+  .stApp { background-color: #0a0c10; }
+
+  .block-container {
+    max-width: 1080px !important;
+    padding-top: 2.5rem !important;
+    padding-bottom: 4rem !important;
+  }
+
+  /* ---------- header ---------- */
+  .rg-header { text-align: center; margin-bottom: 2rem; }
+  .rg-title {
+    font-size: 2.9rem; font-weight: 800; margin: 0 0 .35rem 0;
+    background: linear-gradient(90deg, #58a6ff, #bc8cff);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    background-clip: text; line-height: 1.15;
+  }
+  .rg-tagline { color: #8b949e; font-size: 1.05rem; margin: 0 0 .9rem 0; }
+  .rg-badges { display: flex; gap: .5rem; justify-content: center; flex-wrap: wrap; }
+  .rg-badge {
+    padding: 4px 12px; border-radius: 999px; background: #161b22;
+    border: 1px solid #30363d; color: #58a6ff; font-size: .72rem;
+    font-weight: 600; letter-spacing: .06em; text-transform: uppercase;
+  }
+  .rg-badge.green { color: #3fb950; }
+  .rg-badge.dim { color: #8b949e; }
+
+  /* ---------- cards ---------- */
+  .st-key-input_card, .st-key-result_card {
+    background: #0d1117;
+    border: 1px solid #30363d !important;
+    border-radius: 16px !important;
+    padding: 1.5rem 1.6rem !important;
+    box-shadow: 0 8px 28px rgba(0,0,0,.35);
+  }
+  .st-key-result_card { border-left: 3px solid #58a6ff !important; }
+
+  .rg-section {
+    color: #c9d1d9; font-size: .95rem; font-weight: 600;
+    letter-spacing: .04em; text-transform: uppercase; margin: 0 0 .9rem 0;
+  }
+
+  /* ---------- widgets ---------- */
+  .stTextArea textarea, .stTextInput input {
+    background: #010409 !important; color: #c9d1d9 !important;
+    border: 1px solid #30363d !important; border-radius: 8px !important;
+    font-family: 'JetBrains Mono', 'Consolas', monospace !important;
+    font-size: .88rem !important;
+  }
+  .stTextArea textarea:focus, .stTextInput input:focus {
+    border-color: #58a6ff !important;
+    box-shadow: 0 0 0 1px #58a6ff !important;
+  }
+
+  div.stButton > button {
+    border-radius: 8px !important; font-weight: 600 !important;
+    border: 1px solid #30363d !important; transition: all .15s ease;
+  }
+  div.stButton > button[kind="primary"] {
+    background: linear-gradient(90deg, #1f6feb, #8957e5) !important;
+    border: none !important; color: #fff !important;
+  }
+  div.stButton > button[kind="primary"]:hover { filter: brightness(1.15); }
+  div.stButton > button[kind="secondary"] {
+    background: #21262d !important; color: #c9d1d9 !important;
+  }
+  div.stButton > button[kind="secondary"]:hover {
+    border-color: #58a6ff !important; color: #58a6ff !important;
+  }
+
+  /* ---------- tabs ---------- */
+  .stTabs [data-baseweb="tab-list"] { gap: .35rem; }
+  .stTabs [data-baseweb="tab"] {
+    background: #161b22; border-radius: 8px 8px 0 0;
+    padding: .5rem 1rem; color: #8b949e;
+  }
+  .stTabs [aria-selected="true"] { background: #1f6feb22; color: #f0f6fc; }
+
+  /* ---------- markdown output ---------- */
+  [data-testid="stMarkdownContainer"] code {
+    background: #161b22; color: #ff7b72; padding: 2px 6px;
+    border-radius: 4px; border: 1px solid #30363d; font-size: .86em;
+  }
+  [data-testid="stMarkdownContainer"] pre {
+    background: #010409 !important; border: 1px solid #30363d;
+    border-radius: 8px; padding: .9rem;
+  }
+  [data-testid="stMarkdownContainer"] h2 {
+    color: #f0f6fc; font-size: 1.25rem; margin-top: 1.6rem;
+    padding-bottom: .35rem; border-bottom: 1px solid #21262d;
+  }
+  [data-testid="stMarkdownContainer"] h3 { color: #f0f6fc; font-size: 1.05rem; }
+  [data-testid="stMarkdownContainer"] p, [data-testid="stMarkdownContainer"] li {
+    color: #c9d1d9; line-height: 1.7;
+  }
+
+  /* ---------- misc ---------- */
+  .rg-footer {
+    text-align: center; color: #484f58; font-size: .78rem; padding: 2.5rem 0 0 0;
+  }
+  .rg-hint { color: #8b949e; font-size: .82rem; }
+  [data-testid="stSidebar"] { background: #0d1117; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+# --------------------------------------------------------------------------
+# Session state
+# --------------------------------------------------------------------------
+DEFAULTS = {
+    "model_messages": None,   # what we send to the model
+    "transcript": [],         # what we show the user
+    "context_stats": None,
+    "pending_analysis": False,
+    "analysis_meta": None,
+}
+for key, value in DEFAULTS.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+
+def reset_analysis() -> None:
+    st.session_state.model_messages = None
+    st.session_state.transcript = []
+    st.session_state.context_stats = None
+    st.session_state.analysis_meta = None
+    st.session_state.pending_analysis = False
+
+
+client = OllamaClient()
+
+# --------------------------------------------------------------------------
+# Sidebar: connection + model + settings
+# --------------------------------------------------------------------------
+with st.sidebar:
+    st.markdown(f"### {config.APP_ICON} {config.APP_NAME}")
+    st.caption(f"v{config.VERSION} · local & private")
+
+    is_up, health_message = client.health()
+    if is_up:
+        st.success(health_message, icon="✅")
+        models = []
+        try:
+            models = client.list_models()
+        except OllamaError as exc:
+            st.error(str(exc))
+    else:
+        st.error(health_message, icon="⚠️")
+        models = []
+
+    if models:
+        labels = {m.name: m.label for m in models}
+        selected_model = st.selectbox(
+            "Model",
+            options=[m.name for m in models],
+            format_func=lambda name: labels.get(name, name),
+            help="Every model listed here runs locally via Ollama.",
+        )
+    else:
+        selected_model = None
+        st.info(
+            "No models installed yet.\n\n"
+            "```\nollama pull gemma\n```",
+            icon="📥",
+        )
+
+    with st.expander("Advanced", expanded=False):
+        temperature = st.slider(
+            "Temperature", 0.0, 1.0, 0.3, 0.05,
+            help="Lower = more literal and predictable. Higher = more creative.",
+        )
+        num_ctx = st.select_slider(
+            "Context window (tokens)",
+            options=config.NUM_CTX_CHOICES,
+            value=config.DEFAULT_NUM_CTX,
+            help="Larger lets you analyse bigger files, but needs more RAM.",
+        )
+        budget_chars = max_chars_for(num_ctx)
+        st.caption(
+            f"≈ {budget_chars:,} characters of source "
+            f"(≈ {budget_chars // 1024} KB) per analysis."
+        )
+
+    if st.button("↺ Reset session", use_container_width=True):
+        reset_analysis()
+        st.rerun()
+
+    with st.expander("Recommended open-weight models"):
+        for rec in config.RECOMMENDED_MODELS:
+            installed = any(m.name.startswith(rec["tag"].split(":")[0]) for m in models)
+            mark = "✅ installed" if installed else "⬇️ not installed"
+            st.markdown(f"**{rec['label']}** · {mark}")
+            st.caption(rec["why"])
+            if not installed:
+                st.code(f"ollama pull {rec['tag']}", language="bash")
+
+# --------------------------------------------------------------------------
+# Header
+# --------------------------------------------------------------------------
+model_badge = selected_model or "no model"
+st.markdown(
+    f"""
+<div class="rg-header">
+  <h1 class="rg-title">{config.APP_ICON} {config.APP_NAME}</h1>
+  <p class="rg-tagline">Understand any codebase, one step at a time.</p>
+  <div class="rg-badges">
+    <span class="rg-badge">{model_badge}</span>
+    <span class="rg-badge green">100% local</span>
+    <span class="rg-badge dim">open weights</span>
+  </div>
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
+# --------------------------------------------------------------------------
+# Input card
+# --------------------------------------------------------------------------
+with st.container(border=True, key="input_card"):
+    st.markdown('<p class="rg-section">1 · Where is the code?</p>', unsafe_allow_html=True)
+
+    tab_paste, tab_upload, tab_github = st.tabs(["📋 Paste", "📁 Upload", "🔗 GitHub"])
+
+    with tab_paste:
+        pasted = st.text_area(
+            "Paste code or a README",
+            height=220,
+            placeholder="Paste a snippet, a file, or a whole README.md …",
+            label_visibility="collapsed",
+        )
+
+    with tab_upload:
+        uploads = st.file_uploader(
+            "Drop source files or a .zip of the project",
+            accept_multiple_files=True,
+            help=f"Up to {config.MAX_FILES} files. Individual files under "
+                 f"{config.MAX_FILE_BYTES // 1000} KB.",
+            label_visibility="collapsed",
+        )
+        st.caption(
+            "Source files (`.py`, `.js`, `.java`, …) and `.zip` archives. "
+            "Binary files and build folders are skipped automatically."
+        )
+
+    with tab_github:
+        github_url = st.text_input(
+            "Public GitHub repository URL",
+            placeholder="https://github.com/owner/repo",
+            label_visibility="collapsed",
+        )
+        st.caption(
+            "Public repos only. The archive is downloaded once, filtered to source "
+            "files, and never stored on disk."
+        )
+
+    st.markdown(
+        '<p class="rg-section" style="margin-top:1.4rem">2 · What should I do with it?</p>',
+        unsafe_allow_html=True,
+    )
+    mode_id = st.radio(
+        "Analysis type",
+        options=list(MODES.keys()),
+        format_func=lambda key: f"{MODES[key]['icon']}  {MODES[key]['label']}",
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    st.markdown(
+        f'<p class="rg-hint">{MODES[mode_id]["help"]}</p>', unsafe_allow_html=True
+    )
+
+    analyze = st.button(
+        "✨ Analyze",
+        type="primary",
+        use_container_width=True,
+        disabled=selected_model is None,
+    )
+
+
+# --------------------------------------------------------------------------
+# Gather input and kick off the analysis
+# --------------------------------------------------------------------------
+def collect_ingest() -> Ingest | None:
+    """Pick whichever input tab actually holds something."""
+    if pasted and pasted.strip():
+        return from_text(pasted)
+    if uploads:
+        return from_uploads(uploads)
+    if github_url and github_url.strip():
+        with st.spinner("Downloading repository…"):
+            ingest = from_github(github_url)
+        if not ingest and ingest.skipped:
+            st.error(f"Couldn't use that repository: {ingest.skipped[0]}")
+            return None
+        return ingest
+    return None
+
+
+if analyze:
+    reset_analysis()
+    ingest = collect_ingest()
+
+    if ingest is None:
+        st.warning("Add something to analyse first — paste, upload, or paste a GitHub URL.")
+    elif not ingest:
+        st.error("No readable source files found in that input.")
+    else:
+        context = render(ingest, budget_chars)
+        if not context.text.strip():
+            st.error("Nothing fit inside the context window. Try a bigger context size.")
         else:
-            return f"Error: Ollama API returned status code {response.status_code}"
-    except requests.exceptions.ConnectionError:
-        return "Error: Could not connect to Ollama. Please make sure Ollama is running locally on port 11434."
-    except Exception as e:
-        return f"An unexpected error occurred: {str(e)}"
+            st.session_state.context_stats = context
+            st.session_state.model_messages = build_analysis_messages(
+                mode_id,
+                context.text,
+                included=context.included,
+                dropped=context.dropped,
+                truncated=context.truncated,
+            )
+            st.session_state.analysis_meta = {
+                "mode": f"{MODES[mode_id]['icon']} {MODES[mode_id]['label']}",
+                "source": ingest.source,
+                "files": context.included,
+                "skipped": len(ingest.skipped),
+            }
+            st.session_state.pending_analysis = True
+            st.rerun()
 
-# UI Setup
-st.set_page_config(page_title="RepoGuide AI", page_icon="📚", layout="wide")
 
-# Professional Developer Theme CSS
-st.markdown("""
-    <style>
-    /* Main App Background */
-    .stApp {
-        background-color: #0a0c10;
-    }
-    
-    /* Center content and set max width for a professional feel */
-    .block-container {
-        max-width: 1000px !important;
-        padding-top: 3rem !important;
-    }
+# --------------------------------------------------------------------------
+# Results
+# --------------------------------------------------------------------------
+def stream_reply(messages: list[dict]):
+    """Generator handed to st.write_stream."""
+    return client.chat_stream(
+        selected_model,
+        messages,
+        temperature=temperature,
+        num_ctx=num_ctx,
+    )
 
-    /* Header Styling */
-    .header-area {
-        text-align: center;
-        margin-bottom: 3rem;
-    }
-    .main-title {
-        font-size: 3rem !important;
-        font-weight: 800 !important;
-        color: #f0f6fc !important;
-        margin-bottom: 0.5rem !important;
-        background: linear-gradient(90deg, #58a6ff, #bc8cff);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-    }
-    .tagline {
-        font-size: 1.2rem !important;
-        color: #8b949e !important;
-        margin-bottom: 1rem !important;
-    }
-    .model-badge {
-        display: inline-block;
-        padding: 4px 12px;
-        border-radius: 20px;
-        background-color: #161b22;
-        border: 1px solid #30363d;
-        color: #58a6ff;
-        font-size: 0.75rem;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 1px;
-    }
 
-    /* Input Panel Styling */
-    .input-section {
-        background-color: #0d1117;
-        border: 1px solid #30363d;
-        border-radius: 16px;
-        padding: 2rem;
-        margin-bottom: 2rem;
-        box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-    }
-    .section-heading {
-        color: #c9d1d9 !important;
-        font-size: 1.1rem !important;
-        font-weight: 600 !important;
-        margin-bottom: 1.5rem !important;
-        display: flex;
-        align-items: center;
-        gap: 10px;
-    }
+stats = st.session_state.context_stats
+if stats is not None:
+    meta = st.session_state.analysis_meta or {}
+    st.markdown(
+        f"""
+<div class="rg-badges" style="justify-content:flex-start;margin:1.6rem 0 .6rem 0">
+  <span class="rg-badge">{meta.get('mode', 'analysis')}</span>
+  <span class="rg-badge dim">{meta.get('files', 0)} files · ≈{stats.approx_tokens:,} tok</span>
+  <span class="rg-badge dim">{meta.get('source', '')}</span>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
 
-    /* Input Widgets */
-    .stTextArea textarea {
-        background-color: #010409 !important;
-        color: #c9d1d9 !important;
-        border: 1px solid #30363d !important;
-        border-radius: 8px !important;
-        font-family: 'JetBrains Mono', 'Fira Code', monospace !important;
-        font-size: 0.9rem !important;
-    }
-    .stSelectbox label, .stTextArea label {
-        color: #8b949e !important;
-        font-size: 0.9rem !important;
-    }
+    if stats.dropped or stats.truncated:
+        bits = []
+        if stats.dropped:
+            bits.append(f"{stats.dropped} file(s) didn't fit")
+        if stats.truncated:
+            bits.append("one file was truncated")
+        st.caption(
+            "⚠️ " + " and ".join(bits) + ". Raise the context window in Advanced, "
+            "or analyse fewer files at once."
+        )
 
-    /* Action Buttons */
-    div.stButton > button {
-        background-color: #21262d !important;
-        color: #f0f6fc !important;
-        border: 1px solid #30363d !important;
-        border-radius: 8px !important;
-        padding: 0.6rem 1rem !important;
-        font-weight: 500 !important;
-        transition: all 0.2s ease;
-        width: 100%;
-    }
-    div.stButton > button:hover {
-        border-color: #58a6ff !important;
-        background-color: #30363d !important;
-        color: #58a6ff !important;
-        box-shadow: 0 0 15px rgba(88, 166, 255, 0.15);
-    }
+    with st.container(border=True, key="result_card"):
+        # 1. Everything said so far.
+        for message in st.session_state.transcript:
+            avatar = "📚" if message["role"] == "assistant" else "🧑‍💻"
+            with st.chat_message(message["role"], avatar=avatar):
+                st.markdown(message["content"])
 
-    /* Analysis Section */
-    .analysis-heading {
-        color: #f0f6fc !important;
-        font-size: 1.5rem !important;
-        font-weight: 700 !important;
-        margin-top: 3rem !important;
-        margin-bottom: 1rem !important;
-        border-bottom: 1px solid #30363d;
-        padding-bottom: 0.5rem;
-    }
-    .response-container {
-        background-color: #0d1117;
-        border: 1px solid #30363d;
-        border-left: 4px solid #58a6ff;
-        border-radius: 12px;
-        padding: 2rem;
-        color: #c9d1d9;
-        line-height: 1.7;
-        width: 100%;
-        box-shadow: 0 10px 30px rgba(0,0,0,0.5);
-    }
-    .response-container h1, .response-container h2, .response-container h3 {
-        color: #f0f6fc !important;
-        margin-top: 1.8rem !important;
-        margin-bottom: 0.8rem !important;
-    }
-    .response-container p {
-        margin-bottom: 1.2rem !important;
-    }
-    .response-container ul, .response-container ol {
-        margin-bottom: 1.2rem !important;
-        padding-left: 1.5rem !important;
-    }
-    .response-container li {
-        margin-bottom: 0.5rem !important;
-    }
-    /* Style embedded code blocks in responses */
-    .stMarkdown code {
-        background-color: #161b22 !important;
-        color: #ff7b72 !important;
-        padding: 2px 6px !important;
-        border-radius: 4px !important;
-        border: 1px solid #30363d !important;
-    }
-    .stMarkdown pre {
-        background-color: #010409 !important;
-        border-radius: 8px !important;
-        border: 1px solid #30363d !important;
-        padding: 1rem !important;
-    }
-    
-    /* Footer */
-    .footer {
-        text-align: center;
-        padding: 3rem 0;
-        color: #484f58;
-        font-size: 0.8rem;
-    }
-    </style>
-    """, unsafe_allow_html=True)
+        # 2. The answer we still owe the user, streamed live.
+        if st.session_state.pending_analysis:
+            st.session_state.pending_analysis = False
+            with st.chat_message("assistant", avatar="📚"):
+                started = time.perf_counter()
+                try:
+                    answer = st.write_stream(
+                        stream_reply(st.session_state.model_messages)
+                    )
+                except (ModelMissing, OllamaError) as exc:
+                    st.error(str(exc))
+                    answer = None
 
-# Header Section
-st.markdown('<div class="header-area">', unsafe_allow_html=True)
-st.markdown('<h1 class="main-title">📚 RepoGuide AI</h1>', unsafe_allow_html=True)
-st.markdown('<p class="tagline">Understand any codebase. One step at a time.</p>', unsafe_allow_html=True)
-st.markdown('<div class="model-badge">Powered by Gemma 4 + Ollama</div>', unsafe_allow_html=True)
-st.markdown('</div>', unsafe_allow_html=True)
+                if answer:
+                    elapsed = time.perf_counter() - started
+                    st.session_state.model_messages.append(
+                        {"role": "assistant", "content": answer}
+                    )
+                    st.session_state.transcript.append(
+                        {"role": "assistant", "content": answer}
+                    )
+                    st.caption(f"⏱ {elapsed:.1f}s")
 
-# Workspace
-st.markdown('<div class="input-section">', unsafe_allow_html=True)
-st.markdown('<div class="section-heading">📂 Input Workspace</div>', unsafe_allow_html=True)
+    # -- follow-up questions ------------------------------------------------
+    question = st.chat_input("Ask a follow-up about this code…")
+    if question:
+        st.session_state.model_messages.append({"role": "user", "content": question})
+        st.session_state.transcript.append({"role": "user", "content": question})
 
-# Model Selection
-available_models = get_available_models()
-if not available_models:
-    st.warning("⚠️ No Ollama models detected. I'll try using 'gemma' by default, but please make sure you have a model pulled (e.g., `ollama pull gemma`).")
-    selected_model = DEFAULT_MODEL
-else:
-    selected_model = st.selectbox("Select AI Model", available_models)
+        with st.chat_message("user", avatar="🧑‍💻"):
+            st.markdown(question)
 
-# Input Area
-user_input = st.text_area("Paste your Code or README here:", height=300, placeholder="Paste code snippets or README.md content...", help="Input the code or documentation you want the AI to explain.")
+        with st.chat_message("assistant", avatar="📚"):
+            started = time.perf_counter()
+            try:
+                answer = st.write_stream(stream_reply(st.session_state.model_messages))
+            except OllamaError as exc:
+                st.error(str(exc))
+                answer = None
+            if answer:
+                st.session_state.model_messages.append({"role": "assistant", "content": answer})
+                st.session_state.transcript.append({"role": "assistant", "content": answer})
+                st.caption(f"⏱ {time.perf_counter() - started:.1f}s")
 
-# Action Buttons
-col1, col2, col3 = st.columns(3)
+    # -- export -------------------------------------------------------------
+    if st.session_state.transcript:
+        export = [
+            f"# {config.APP_NAME} — {meta.get('mode', 'Analysis')}",
+            f"\n_Source: {meta.get('source', '')} · {meta.get('files', 0)} files · "
+            f"model `{selected_model}`_\n",
+        ]
+        for message in st.session_state.transcript:
+            role = "### 🧑‍💻 You" if message["role"] == "user" else "### 📚 RepoGuide"
+            export.append(f"\n{role}\n\n{message['content']}\n")
+        st.download_button(
+            "⬇️  Download this analysis (.md)",
+            data="".join(export),
+            file_name="repoguide-analysis.md",
+            mime="text/markdown",
+        )
 
-with col1:
-    if st.button("🚀 Explain Project"):
-        if user_input.strip():
-            with st.spinner("Analyzing..."):
-                result = call_ollama("Explain this project in simple terms for a complete beginner. Focus on what it does and the main goal.", user_input, selected_model)
-                st.session_state['ai_response'] = result
-                st.session_state['response_type'] = 'Project'
-        else:
-            st.error("Please paste some content first!")
+if stats is None and not analyze:
+    with st.container(border=True):
+        st.markdown(
+            """
+<p class="rg-hint">
+Nothing analysed yet. Pick an input above and hit <b>Analyze</b> — everything
+runs on your machine, so nothing you paste leaves your computer.
+</p>
+""",
+            unsafe_allow_html=True,
+        )
 
-with col2:
-    if st.button("💻 Explain Code"):
-        if user_input.strip():
-            with st.spinner("Decoding..."):
-                result = call_ollama("Explain this code snippet step-by-step for a beginner. Tell me how it works and why certain parts are used.", user_input, selected_model)
-                st.session_state['ai_response'] = result
-                st.session_state['response_type'] = 'Code'
-        else:
-            st.error("Please paste some content first!")
-
-with col3:
-    if st.button("🏁 Where to Start?"):
-        if user_input.strip():
-            with st.spinner("Mapping..."):
-                result = call_ollama("Looking at this content, if I were a beginner wanting to contribute or run this, where is the best place to start? What files or sections should I look at first?", user_input, selected_model)
-                st.session_state['ai_response'] = result
-                st.session_state['response_type'] = 'Starting Point'
-        else:
-            st.error("Please paste some content first!")
-st.markdown('</div>', unsafe_allow_html=True)
-
-# Results Section
-if 'ai_response' in st.session_state:
-    st.markdown('<div class="analysis-heading">✨ AI Analysis: ' + st.session_state['response_type'] + '</div>', unsafe_allow_html=True)
-    st.markdown('<div class="response-container">', unsafe_allow_html=True)
-    st.markdown(st.session_state['ai_response'])
-    st.markdown('</div>', unsafe_allow_html=True)
-
-st.markdown('<div class="footer">Processing happens entirely on your local machine. Your data never leaves your computer.</div>', unsafe_allow_html=True)
+st.markdown(
+    f'<div class="rg-footer">{config.APP_NAME} v{config.VERSION} · runs on '
+    f'Ollama · your code never leaves this machine</div>',
+    unsafe_allow_html=True,
+)
